@@ -13,7 +13,11 @@ viral front door; the pooled, high-diversity demonstration dataset is the moat.
 
 ## 🎮 Play
 
-Just open the site — no signup, play in one click. *(Live URL coming once deployed.)*
+**▶ Live: https://robogym.netlify.app** — no signup, play in one click.
+
+Play a few rounds to teach the arm, then hit **"🤖 Watch the AI play what you just taught it"** —
+it solves tasks on its own using an in-browser imitation-learning policy trained on *your*
+demonstrations. The loop closes: you demonstrate → it learns → the robot acts autonomously.
 
 ## 🗂 Project structure
 
@@ -48,7 +52,9 @@ via a free Supabase project, and deploy to Netlify.
 ## 🗺 Roadmap
 
 - [x] Playable game + landing page + data export
-- [ ] **Phase 1** — Supabase backend (global pool/leaderboard) + Netlify deploy
+- [x] **Autopilot** — in-browser nearest-neighbour imitation learning (the arm plays autonomously from your demos)
+- [x] Deployed live to Netlify + GitHub
+- [ ] **Phase 1 (in progress)** — Supabase backend: global pool, global leaderboard, live counter
 - [ ] 3D simulation + more tasks + publish open datasets to Hugging Face
 - [ ] Prove downstream policy lift (beat RoboCade's 16–56%)
 
