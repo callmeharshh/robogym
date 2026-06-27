@@ -158,6 +158,15 @@
   .chip b{color:var(--amber)}
 
   a.link{color:var(--cyan); text-decoration:none; border-bottom:1px solid rgba(73,214,230,.4)}
+
+  .aibanner{position:absolute; left:12px; right:12px; bottom:14px; display:none; align-items:center; gap:10px;
+    font-family:var(--mono); font-size:12px; color:var(--cyan); background:rgba(10,17,31,.85);
+    border:1px solid var(--cyan); border-radius:10px; padding:9px 13px; box-shadow:0 0 22px rgba(73,214,230,.18)}
+  .aibanner b{color:#fff} .aibanner .ai-ic{font-size:16px}
+  .arena.ai-on{box-shadow:inset 0 0 0 2px var(--cyan)}
+  button.act.ai{background:rgba(73,214,230,.12); border-color:var(--cyan); color:var(--cyan); font-weight:700}
+  button.act.ai:hover{background:rgba(73,214,230,.22); border-color:var(--cyan)}
+
   @media(prefers-reduced-motion:reduce){ .dot.live{animation:none} }
 </style>
 </head>
@@ -181,6 +190,7 @@
       <div class="objective"><span class="badge" id="taskBadge">REACH</span><span class="txt" id="taskTxt">Grab the block and drop it on the target.</span></div>
       <div class="scoreHud"><div class="sc" id="hScore">0</div><div class="cb" id="hCombo"></div></div>
       <div class="timebar"><i id="timeFill"></i></div>
+      <div class="aibanner" id="aiBanner"><span class="ai-ic">🤖</span><span>AUTOPILOT — imitating <b id="aiCount">0</b> of your demonstrated moves · not recorded</span></div>
     </div>
 
     <aside class="side">
@@ -208,7 +218,8 @@
         <h4 id="leadTitle">Local leaderboard</h4>
         <div class="lead" id="lead"><div class="empty">No runs yet — set a score.</div></div>
         <div class="btns">
-          <button class="act primary" id="bStart">New run</button>
+          <button class="act" id="bStart">New run</button>
+          <button class="act ai" id="bAuto">🤖 Let it play</button>
         </div>
       </div>
     </aside>
@@ -255,6 +266,7 @@
       <div class="rstat"><div class="l">Demos this run</div><div class="v good" id="rDemos">0</div></div>
       <div class="rstat"><div class="l">Frames recorded</div><div class="v" id="rFrames">0</div></div>
     </div>
+    <button class="act ai" id="rAuto" style="width:100%; margin-bottom:10px">🤖 Watch the AI play what you just taught it →</button>
     <div class="rowbtns">
       <button class="act primary" id="rAgain">Play again</button>
       <button class="act" id="rShare">Share score card</button>
@@ -366,11 +378,41 @@
   const game={
     screen:'intro', mode:'attack', running:false,
     score:0, combo:0, bestCombo:0, comboAt:0, mult:1,
-    timeLeft:60, lastTick:0,
+    timeLeft:60, lastTick:0, autopilot:false,
     task:null, runDemos:0, runFrames:0, runStart:0
   };
   const TASKS=['reach','sort','stack'];
   let episodes=[], curFrames=[], lastLog=0, lastEpisode=null;
+
+  // ===================== imitation policy (nearest-neighbour behavioural cloning) =====================
+  // Learns from demonstrated (situation → action) pairs. Features are translation-invariant
+  // (ee→object, object→goal) so it generalises across task layouts. Scale-invariant (÷ reach).
+  let aiCtrl=null, aiTarget=null, aiGrip=0, aiLast=0;
+  const policy = {
+    samples: (()=>{ try{ return JSON.parse(LS.g('policy','[]')); }catch(e){ return []; } })(),
+    feats(ee,obj,goal,grip){ const R=reachR()||1;
+      return [ (obj[0]-ee[0])/R, (obj[1]-ee[1])/R, (goal[0]-obj[0])/R, (goal[1]-obj[1])/R, grip*1.5 ]; },
+    learn(ep){ if(!ep||!ep.frames) return; const R=reachR()||1;
+      for(const fr of ep.frames){ const o=fr.observation; if(!o.goal) continue;
+        this.samples.push({ f:this.feats(o.ee,o.object,o.goal,o.gripper),
+          a:[ (fr.action.target_ee[0]-o.ee[0])/R, (fr.action.target_ee[1]-o.ee[1])/R, fr.action.gripper ] }); }
+      if(this.samples.length>2600) this.samples=this.samples.slice(-2600);
+      try{ LS.s('policy', JSON.stringify(this.samples)); }catch(e){} },
+    predict(f){ const n=this.samples.length; if(!n) return null; const k=Math.min(6,n); const best=[];
+      for(let i=0;i<n;i++){ const s=this.samples[i]; let d=0; for(let j=0;j<5;j++){ const e=f[j]-s.f[j]; d+=e*e; }
+        if(best.length<k){ best.push({d,a:s.a}); if(best.length===k) best.sort((a,b)=>a.d-b.d); }
+        else if(d<best[k-1].d){ best[k-1]={d,a:s.a}; best.sort((a,b)=>a.d-b.d); } }
+      let wx=0,wy=0,wg=0,ws=0; for(const b of best){ const w=1/(b.d+1e-3); wx+=b.a[0]*w; wy+=b.a[1]*w; wg+=b.a[2]*w; ws+=w; }
+      return { dx:wx/ws, dy:wy/ws, grip:(wg/ws)>0.5?1:0 }; }
+  };
+  // the goal point the current task wants the object to reach
+  function currentGoal(){
+    const t=game.task&&game.task.type, b=blocks[0];
+    if(t==='reach'&&target) return [target.x, groundY-18];
+    if(t==='sort'&&b){ const bin=bins.find(x=>x.key===b.key); return bin?[bin.x, groundY-18]:null; }
+    if(t==='stack'&&baseBlock) return [baseBlock.x, baseBlock.y-baseBlock.s/2-(b?b.s/2:16)];
+    return null;
+  }
 
   // ===================== layout =====================
   function resize(){
@@ -446,8 +488,21 @@
     return f;
   }
   function step(dt){
-    const tx=mouse.inside?mouse.x:baseP.x;
-    const ty=mouse.inside?mouse.y:baseP.y-reachR()*0.7;
+    let tx, ty;
+    if(game.autopilot && game.running){
+      const b=blocks[0], goal=currentGoal(), now=performance.now();
+      if(b && goal && policy.samples.length>=20){
+        if(now-aiLast>55){ aiLast=now;
+          const p=policy.predict(policy.feats([arm.ex,arm.ey],[b.x,b.y],goal,gripperClosed?1:0));
+          if(p){ const R=reachR(); aiTarget=[arm.ex+p.dx*R, arm.ey+p.dy*R]; aiGrip=p.grip; } }
+        if(!aiCtrl) aiCtrl={x:arm.ex,y:arm.ey};
+        if(aiTarget){ aiCtrl.x+=(aiTarget[0]-aiCtrl.x)*0.18; aiCtrl.y+=(aiTarget[1]-aiCtrl.y)*0.18; }
+        tx=aiCtrl.x; ty=aiCtrl.y; gripperClosed=!!aiGrip;
+      } else { tx=arm.ex||baseP.x; ty=arm.ey||baseP.y; }
+    } else {
+      tx=mouse.inside?mouse.x:baseP.x;
+      ty=mouse.inside?mouse.y:baseP.y-reachR()*0.7;
+    }
     const joint=solveIK(tx,ty);
 
     // grab
@@ -496,8 +551,11 @@
     game.score+=gain;
     if(game.mode==='attack') game.timeLeft=Math.min(60,game.timeLeft+2);
 
-    totalDemos++; LS.s('demos',totalDemos); game.runDemos++;
-    flushEpisode(true);
+    if(!game.autopilot){                       // only human play counts as a demo + teaches the policy
+      totalDemos++; LS.s('demos',totalDemos); game.runDemos++;
+      flushEpisode(true);
+      if(lastEpisode) policy.learn(lastEpisode);
+    }
     sWin(game.mult);
     const b=blocks[0]; burst(b.x,b.y,b.color); popup(b.x,b.y-b.s, '+'+gain+(game.mult>1?'  ×'+game.mult:''), COL.amber);
     newTask();
@@ -505,14 +563,15 @@
 
   // ===================== data logging =====================
   function logFrame(tx,ty){
-    if(!game.running) return;
+    if(!game.running || game.autopilot) return;   // never record the AI's own play
     const now=performance.now(); if(now-lastLog<50) return; lastLog=now;
     const b=blocks[0]||{x:0,y:0};
+    const goal=currentGoal()||[0,0];
     curFrames.push({
       t:+((now-game.runStart)/1000).toFixed(2),
       observation:{ joint_angles:[+arm.t1.toFixed(4),+arm.t2.toFixed(4)],
         ee:[Math.round(arm.ex),Math.round(arm.ey)],
-        object:[Math.round(b.x),Math.round(b.y)], gripper:gripperClosed?1:0 },
+        object:[Math.round(b.x),Math.round(b.y)], goal:[Math.round(goal[0]),Math.round(goal[1])], gripper:gripperClosed?1:0 },
       action:{ target_ee:[Math.round(tx),Math.round(ty)], gripper:gripperClosed?1:0 }
     });
     totalFrames++; game.runFrames++; LS.s('frames',totalFrames);
@@ -586,6 +645,8 @@
     $('tS').textContent=arm.t1.toFixed(2); $('tE').textContent=arm.t2.toFixed(2);
     $('tEE').textContent=Math.round(arm.ex)+', '+Math.round(arm.ey);
     $('tG').textContent=gripperClosed?'closed':'open'; $('tG').style.color=gripperClosed?'var(--amber)':'var(--good)';
+    $('recTxt').textContent = game.autopilot ? 'autopilot · not recording' : 'recording episode';
+    $('recDot').style.background = game.autopilot ? 'var(--cyan)' : 'var(--bad)';
     if(game.mode==='attack' && game.running){ $('timeFill').style.transform='scaleX('+clamp(game.timeLeft/60,0,1)+')'; }
     else $('timeFill').style.transform='scaleX(1)';
   }
@@ -612,7 +673,8 @@
     if(ac() && actx.state==='suspended') actx.resume();
     game.score=0; game.combo=0; game.bestCombo=0; game.mult=1; game.timeLeft=60;
     game.runDemos=0; game.runFrames=0; game.runStart=performance.now(); game.lastTick=performance.now();
-    episodes=[]; curFrames=[]; game.running=true;
+    episodes=[]; curFrames=[]; game.running=true; game.autopilot=false; aiCtrl=null; aiTarget=null;
+    setAutopilotUI(false);
     newTask();
     $('intro').classList.add('hidden'); $('results').classList.add('hidden');
   }
@@ -668,8 +730,35 @@
   $('handle').value=handle;
   $('bGo').onclick=()=>{ handle=($('handle').value||'guest').trim().slice(0,16)||'guest';
     LS.s('handle',handle); refreshProfile(); startRun(); };
-  $('bStart').onclick=()=>{ game.running=false; $('intro').classList.remove('hidden'); $('handle').value=handle; };
+  $('bStart').onclick=()=>{ game.running=false; game.autopilot=false; setAutopilotUI(false); $('intro').classList.remove('hidden'); $('handle').value=handle; };
   $('rAgain').onclick=startRun;
+
+  // ---- autopilot (imitation learning) controls ----
+  function setAutopilotUI(on){
+    const ban=$('aiBanner'); if(ban) ban.style.display=on?'flex':'none';
+    const ab=$('bAuto'); if(ab) ab.textContent=on?'🎮 Take control':'🤖 Let it play';
+    if(on) $('aiCount').textContent=policy.samples.length.toLocaleString();
+    const ar=document.querySelector('.arena'); if(ar) ar.classList.toggle('ai-on',on);
+  }
+  function flashTeach(){
+    const t=$('taskTxt'), old=t.textContent;
+    t.textContent='🤖 Teach me first — play a round or two, then I can try it myself!';
+    setTimeout(()=>{ if(t.textContent.startsWith('🤖 Teach')) t.textContent=old; },2800);
+  }
+  function startAutoRun(){
+    if(policy.samples.length<20){ $('results').classList.add('hidden'); flashTeach(); return; }
+    startRun(); game.mode='zen'; game.autopilot=true; aiCtrl={x:arm.ex,y:arm.ey}; aiTarget=null;
+    if(ac() && actx.state==='suspended') actx.resume();
+    setAutopilotUI(true);
+  }
+  function toggleAutopilot(){
+    if(!game.running){ startAutoRun(); return; }
+    if(game.autopilot){ game.autopilot=false; setAutopilotUI(false); }   // hand control back to the human
+    else { if(policy.samples.length<20){ flashTeach(); return; }
+      game.autopilot=true; aiCtrl={x:arm.ex,y:arm.ey}; aiTarget=null; setAutopilotUI(true); }
+  }
+  $('bAuto').onclick=toggleAutopilot;
+  $('rAuto').onclick=startAutoRun;
   $('bMute').onclick=()=>{ muted=!muted; LS.s('mute',muted?'1':'0'); $('bMute').textContent=muted?'🔇':'🔊'; };
   $('bMute').textContent=muted?'🔇':'🔊';
 
@@ -678,7 +767,7 @@
     const all = curFrames.length ? episodes.concat([{episode_index:episodes.length,task:game.task?game.task.type:'?',success:false,frames:curFrames}]) : episodes;
     return { meta:{ env:'robogym-2d-v0', format:'lerobot-like', fps:20,
       action_space:'target_ee[x,y] + gripper{0,1}',
-      observation_space:'joint_angles[2], ee[2], object[2], gripper{0,1}',
+      observation_space:'joint_angles[2], ee[2], object[2], goal[2], gripper{0,1}',
       contributor:handle||'guest', episodes:all.length,
       total_frames:all.reduce((s,e)=>s+e.frames.length,0) }, episodes:all };
   }
