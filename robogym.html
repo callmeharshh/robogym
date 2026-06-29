@@ -163,6 +163,8 @@
     font-family:var(--mono); font-size:12px; color:var(--cyan); background:rgba(10,17,31,.85);
     border:1px solid var(--cyan); border-radius:10px; padding:9px 13px; box-shadow:0 0 22px rgba(73,214,230,.18)}
   .aibanner b{color:#fff} .aibanner .ai-ic{font-size:16px}
+  .aibanner .aitext{display:flex; flex-direction:column; gap:2px; line-height:1.4}
+  .aibanner .ai-l2{color:var(--paper); font-size:11px} .aibanner .ai-l2 b{color:var(--amber)}
   .arena.ai-on{box-shadow:inset 0 0 0 2px var(--cyan)}
   button.act.ai{background:rgba(73,214,230,.12); border-color:var(--cyan); color:var(--cyan); font-weight:700}
   button.act.ai:hover{background:rgba(73,214,230,.22); border-color:var(--cyan)}
@@ -190,7 +192,7 @@
       <div class="objective"><span class="badge" id="taskBadge">REACH</span><span class="txt" id="taskTxt">Grab the block and drop it on the target.</span></div>
       <div class="scoreHud"><div class="sc" id="hScore">0</div><div class="cb" id="hCombo"></div></div>
       <div class="timebar"><i id="timeFill"></i></div>
-      <div class="aibanner" id="aiBanner"><span class="ai-ic">🤖</span><span>AUTOPILOT — imitating <b id="aiCount">0</b> of your demonstrated moves · not recorded</span></div>
+      <div class="aibanner" id="aiBanner"><span class="ai-ic">🤖</span><span class="aitext"><span class="ai-l1">AUTOPILOT — imitating <b id="aiCount">0</b> moves you taught it · not recorded</span><span class="ai-l2" id="aiLearn">learning…</span></span></div>
     </div>
 
     <aside class="side">
@@ -388,6 +390,7 @@
   // Learns from demonstrated (situation → action) pairs. Features are translation-invariant
   // (ee→object, object→goal) so it generalises across task layouts. Scale-invariant (÷ reach).
   let aiCtrl=null, aiTarget=null, aiGrip=0, aiLast=0;
+  let demoSeq=+LS.g('demoseq',0);   // monotonic id so each learned demo is attributable
   const policy = {
     samples: (()=>{ try{ return JSON.parse(LS.g('policy2','[]')); }catch(e){ return []; } })(),
     feats(ee,obj,goal,grip){ const R=reachR()||1;
@@ -395,18 +398,19 @@
     // action = where the human moved the end-effector NEXT (a short horizon ahead), NOT target_ee−ee
     // (which is ~0 since the arm already tracks the cursor each frame). This is the real motion to imitate.
     learn(ep){ if(!ep||!ep.frames||ep.frames.length<2) return; const R=reachR()||1, F=ep.frames, H=6;
+      demoSeq++; const src={ task:ep.task, by:(handle||'guest'), id:demoSeq };   // provenance
       for(let i=0;i<F.length-1;i++){ const o=F[i].observation; if(!o.goal) continue;
         const nx=F[Math.min(i+H,F.length-1)].observation;
         this.samples.push({ f:this.feats(o.ee,o.object,o.goal,o.gripper),
-          a:[ (nx.ee[0]-o.ee[0])/R, (nx.ee[1]-o.ee[1])/R, F[i].action.gripper ] }); }
+          a:[ (nx.ee[0]-o.ee[0])/R, (nx.ee[1]-o.ee[1])/R, F[i].action.gripper ], src }); }
       if(this.samples.length>3000) this.samples=this.samples.slice(-3000);
-      try{ LS.s('policy2', JSON.stringify(this.samples)); }catch(e){} },
+      try{ LS.s('policy2', JSON.stringify(this.samples)); LS.s('demoseq',demoSeq); }catch(e){} },
     predict(f){ const n=this.samples.length; if(!n) return null; const k=Math.min(8,n); const best=[];
       for(let i=0;i<n;i++){ const s=this.samples[i]; let d=0; for(let j=0;j<5;j++){ const e=f[j]-s.f[j]; d+=e*e; }
-        if(best.length<k){ best.push({d,a:s.a}); if(best.length===k) best.sort((a,b)=>a.d-b.d); }
-        else if(d<best[k-1].d){ best[k-1]={d,a:s.a}; best.sort((a,b)=>a.d-b.d); } }
+        if(best.length<k){ best.push({d,a:s.a,src:s.src}); if(best.length===k) best.sort((a,b)=>a.d-b.d); }
+        else if(d<best[k-1].d){ best[k-1]={d,a:s.a,src:s.src}; best.sort((a,b)=>a.d-b.d); } }
       let wx=0,wy=0,wg=0,ws=0; for(const b of best){ const w=1/(b.d+1e-3); wx+=b.a[0]*w; wy+=b.a[1]*w; wg+=b.a[2]*w; ws+=w; }
-      return { dx:wx/ws, dy:wy/ws, grip:(wg/ws)>0.5?1:0 }; }
+      return { dx:wx/ws, dy:wy/ws, grip:(wg/ws)>0.5?1:0, src:best[0].src, dist:best[0].d }; }
   };
   // the goal point the current task wants the object to reach
   function currentGoal(){
@@ -497,7 +501,7 @@
       if(b && goal && policy.samples.length>=20){
         if(now-aiLast>45){ aiLast=now;
           const p=policy.predict(policy.feats([arm.ex,arm.ey],[b.x,b.y],goal,gripperClosed?1:0));
-          if(p){ const R=reachR(); aiTarget=[arm.ex+p.dx*R*1.3, arm.ey+p.dy*R*1.3]; aiGrip=p.grip; } }
+          if(p){ const R=reachR(); aiTarget=[arm.ex+p.dx*R*1.3, arm.ey+p.dy*R*1.3]; aiGrip=p.grip; showLearnedFrom(p,b,goal); } }
         if(!aiCtrl) aiCtrl={x:arm.ex,y:arm.ey};
         if(aiTarget){ aiCtrl.x+=(aiTarget[0]-aiCtrl.x)*0.22; aiCtrl.y+=(aiTarget[1]-aiCtrl.y)*0.22; }
         tx=aiCtrl.x; ty=aiCtrl.y; gripperClosed=!!aiGrip;
@@ -740,8 +744,19 @@
   function setAutopilotUI(on){
     const ban=$('aiBanner'); if(ban) ban.style.display=on?'flex':'none';
     const ab=$('bAuto'); if(ab) ab.textContent=on?'🎮 Take control':'🤖 Let it play';
-    if(on) $('aiCount').textContent=policy.samples.length.toLocaleString();
+    if(on){ $('aiCount').textContent=policy.samples.length.toLocaleString(); $('aiLearn').textContent='🧠 warming up…'; }
     const ar=document.querySelector('.arena'); if(ar) ar.classList.toggle('ai-on',on);
+  }
+  // surface WHICH human demonstration the AI is imitating right now (proves it learned, not scripted)
+  function showLearnedFrom(p,b,goal){
+    const el=$('aiLearn'); if(!el||!p||!p.src) return;
+    const held=b&&b.held;
+    const dObj=b?Math.hypot(arm.ex-b.x,arm.ey-b.y):999;
+    const dGoal=(b&&goal)?Math.hypot(b.x-goal[0],b.y-goal[1]):999;
+    const phase = held ? (dGoal<b.s*1.3?'PLACING':'CARRYING') : (dObj<b.s*1.3?'GRASPING':'REACHING');
+    const conf = clamp(Math.round(100/(1+p.dist*6)),6,99);
+    const who = p.src.by===handle ? 'your' : '@'+p.src.by;
+    el.innerHTML = `🧠 ${phase} — copying ${who} <b>${(p.src.task||'').toUpperCase()}</b> demo #${p.src.id} · ${conf}% match`;
   }
   function flashTeach(){
     const t=$('taskTxt'), old=t.textContent;
