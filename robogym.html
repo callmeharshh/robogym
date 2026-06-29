@@ -389,16 +389,19 @@
   // (ee→object, object→goal) so it generalises across task layouts. Scale-invariant (÷ reach).
   let aiCtrl=null, aiTarget=null, aiGrip=0, aiLast=0;
   const policy = {
-    samples: (()=>{ try{ return JSON.parse(LS.g('policy','[]')); }catch(e){ return []; } })(),
+    samples: (()=>{ try{ return JSON.parse(LS.g('policy2','[]')); }catch(e){ return []; } })(),
     feats(ee,obj,goal,grip){ const R=reachR()||1;
       return [ (obj[0]-ee[0])/R, (obj[1]-ee[1])/R, (goal[0]-obj[0])/R, (goal[1]-obj[1])/R, grip*1.5 ]; },
-    learn(ep){ if(!ep||!ep.frames) return; const R=reachR()||1;
-      for(const fr of ep.frames){ const o=fr.observation; if(!o.goal) continue;
+    // action = where the human moved the end-effector NEXT (a short horizon ahead), NOT target_ee−ee
+    // (which is ~0 since the arm already tracks the cursor each frame). This is the real motion to imitate.
+    learn(ep){ if(!ep||!ep.frames||ep.frames.length<2) return; const R=reachR()||1, F=ep.frames, H=6;
+      for(let i=0;i<F.length-1;i++){ const o=F[i].observation; if(!o.goal) continue;
+        const nx=F[Math.min(i+H,F.length-1)].observation;
         this.samples.push({ f:this.feats(o.ee,o.object,o.goal,o.gripper),
-          a:[ (fr.action.target_ee[0]-o.ee[0])/R, (fr.action.target_ee[1]-o.ee[1])/R, fr.action.gripper ] }); }
-      if(this.samples.length>2600) this.samples=this.samples.slice(-2600);
-      try{ LS.s('policy', JSON.stringify(this.samples)); }catch(e){} },
-    predict(f){ const n=this.samples.length; if(!n) return null; const k=Math.min(6,n); const best=[];
+          a:[ (nx.ee[0]-o.ee[0])/R, (nx.ee[1]-o.ee[1])/R, F[i].action.gripper ] }); }
+      if(this.samples.length>3000) this.samples=this.samples.slice(-3000);
+      try{ LS.s('policy2', JSON.stringify(this.samples)); }catch(e){} },
+    predict(f){ const n=this.samples.length; if(!n) return null; const k=Math.min(8,n); const best=[];
       for(let i=0;i<n;i++){ const s=this.samples[i]; let d=0; for(let j=0;j<5;j++){ const e=f[j]-s.f[j]; d+=e*e; }
         if(best.length<k){ best.push({d,a:s.a}); if(best.length===k) best.sort((a,b)=>a.d-b.d); }
         else if(d<best[k-1].d){ best[k-1]={d,a:s.a}; best.sort((a,b)=>a.d-b.d); } }
@@ -492,11 +495,11 @@
     if(game.autopilot && game.running){
       const b=blocks[0], goal=currentGoal(), now=performance.now();
       if(b && goal && policy.samples.length>=20){
-        if(now-aiLast>55){ aiLast=now;
+        if(now-aiLast>45){ aiLast=now;
           const p=policy.predict(policy.feats([arm.ex,arm.ey],[b.x,b.y],goal,gripperClosed?1:0));
-          if(p){ const R=reachR(); aiTarget=[arm.ex+p.dx*R, arm.ey+p.dy*R]; aiGrip=p.grip; } }
+          if(p){ const R=reachR(); aiTarget=[arm.ex+p.dx*R*1.3, arm.ey+p.dy*R*1.3]; aiGrip=p.grip; } }
         if(!aiCtrl) aiCtrl={x:arm.ex,y:arm.ey};
-        if(aiTarget){ aiCtrl.x+=(aiTarget[0]-aiCtrl.x)*0.18; aiCtrl.y+=(aiTarget[1]-aiCtrl.y)*0.18; }
+        if(aiTarget){ aiCtrl.x+=(aiTarget[0]-aiCtrl.x)*0.22; aiCtrl.y+=(aiTarget[1]-aiCtrl.y)*0.22; }
         tx=aiCtrl.x; ty=aiCtrl.y; gripperClosed=!!aiGrip;
       } else { tx=arm.ex||baseP.x; ty=arm.ey||baseP.y; }
     } else {
